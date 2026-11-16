@@ -1,9 +1,10 @@
 # Public-text hygiene gate. Intended to run as an organisation ruleset
 # required workflow on public repositories; it also runs on this repository.
-# It checks the added lines of the net diff and of every commit, changed file
-# paths, commit messages, commit author/committer identities, the branch name
-# and the pull request title/body with scripts/hygiene-check.mjs, and the
-# commit range with gitleaks.
+# The logic lives in scripts/ (pinned below, covered by test/):
+# scripts/gate.mjs collects the added lines of the net diff and of every
+# commit, changed paths, commit messages, identities, the branch name and the
+# pull request title/body, and runs scripts/hygiene-check.mjs on them.
+# gitleaks checks the commit range for secrets.
 name: public-hygiene
 
 on:
@@ -21,9 +22,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      # Scanner revision in borgels/mcp-hygiene. Bump after changing the scanner.
+      # Revision of scripts/ in borgels/mcp-hygiene. Bump after changing scripts/.
       SCANNER_REPO: borgels/mcp-hygiene
-      SCANNER_SHA: 02f5016585ae63f12e655eab22b35bce03ffcfb5
+      SCANNER_SHA: f8f9ea27ba8a91a3010a24d438e9ade1bf3bcbbe
       GITLEAKS_VERSION: 8.30.1
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
@@ -43,93 +44,18 @@ jobs:
           path: .hygiene-tool
           persist-credentials: false
 
-      - name: Resolve commit range
-        env:
-          EVENT: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          MG_BASE: ${{ github.event.merge_group.base_sha }}
-          MG_HEAD: ${{ github.event.merge_group.head_sha }}
-          ACTOR: ${{ github.actor }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          node -e 'if (+process.versions.node.split(".")[0] < 20) { console.error("Node 20+ required"); process.exit(1) }'
-          if [ "$EVENT" = merge_group ]; then
-            base=$MG_BASE head=$MG_HEAD fork=false
-          else
-            base=$PR_BASE head=$PR_HEAD
-            if [ "$PR_HEAD_REPO" = "$REPO" ]; then fork=false; else fork=true; fi
-          fi
-          # Dependabot runs only receive Dependabot secrets.
-          dependabot=false
-          if [ "$ACTOR" = 'dependabot[bot]' ] && [ "$PR_AUTHOR" = 'dependabot[bot]' ]; then dependabot=true; fi
-          git -C target cat-file -e "$base^{commit}" 2>/dev/null || git -C target fetch --no-tags origin "$base"
-          git -C target cat-file -e "$head^{commit}"
-          {
-            echo "BASE_SHA=$base"
-            echo "HEAD_SHA=$head"
-            echo "IS_FORK=$fork"
-            echo "IS_DEPENDABOT=$dependabot"
-          } >> "$GITHUB_ENV"
-          echo "Range $base..$head (fork: $fork, dependabot: $dependabot)"
-
+      # Event text (title, body, branch) is read from GITHUB_EVENT_PATH and
+      # GITHUB_HEAD_REF inside the script, not passed through env here.
       - name: Collect text to check
-        env:
-          EVENT: ${{ github.event_name }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-          HEAD_REF: ${{ github.head_ref || github.event.merge_group.head_ref }}
-        run: |
-          set -euo pipefail
-          d="$RUNNER_TEMP/hygiene"; mkdir -p "$d/msg"
-          g() { git -C target -c core.quotePath=false "$@"; }
-          range="$BASE_SHA..$HEAD_SHA"
-          # net change plus every commit, so a term added and later removed is still found
-          g diff --text --no-color --no-ext-diff --find-renames "$BASE_SHA...$HEAD_SHA" > "$d/net.diff"
-          g log -p --text --no-color --no-ext-diff --find-renames --format='commit %H' "$range" > "$d/commits.diff"
-          # paths of all changed files, including binary, empty and mode-only changes
-          g diff --name-status -z --find-renames "$BASE_SHA...$HEAD_SHA" > "$d/net.paths"
-          g log --name-status -z --find-renames --format= "$range" > "$d/commits.paths"
-          g log --format='%ae%n%ce' "$range" | sort -u > "$d/identity-emails.txt"
-          g log --format='%an%n%cn' "$range" | sort -u > "$d/identity-names.txt"
-          printf '%s\n' "$HEAD_REF" > "$d/head-ref.txt"
-          args=(--paths "$d/net.paths" --paths "$d/commits.paths" --diff "$d/net.diff" --diff "$d/commits.diff"
-                --label head-ref --text "$d/head-ref.txt" --label commit-email --text "$d/identity-emails.txt")
-          for sha in $(g rev-list "$range"); do
-            g log -1 --format=%B "$sha" > "$d/msg/$sha.txt"
-            args+=(--label "commit-${sha:0:12}" --text "$d/msg/$sha.txt")
-          done
-          if [ "$EVENT" = pull_request ]; then
-            printf '%s\n' "$PR_TITLE" > "$d/pr-title.txt"
-            printf '%s\n' "$PR_BODY" > "$d/pr-body.txt"
-            args+=(--label pr-title --text "$d/pr-title.txt" --label pr-body --text "$d/pr-body.txt")
-          fi
-          # names: generic rules only (a maintainer's own name may be on the denylist)
-          args+=(--rules generic --label commit-name --text "$d/identity-names.txt")
-          printf '%s\0' "${args[@]}" > "$d/args"
-          echo "Commits in range: $(g rev-list --count "$range")"
+        run: node .hygiene-tool/scripts/gate.mjs collect target "$RUNNER_TEMP/hygiene"
 
       - name: Scan
-        id: scan
         if: ${{ !cancelled() && env.BASE_SHA != '' }}
         env:
           HYGIENE_DENYLIST: ${{ secrets.HYGIENE_DENYLIST }}
-        run: |
-          set -uo pipefail
-          if [ -n "${HYGIENE_DENYLIST//[[:space:]]/}" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          elif [ "$IS_FORK" = true ] || [ "$IS_DEPENDABOT" = true ]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Secrets are not available to this run (fork or Dependabot): generic checks only."
-          else
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::HYGIENE_DENYLIST org secret not configured; generic checks run, the job will fail at the end."
-          fi
-          mapfile -d '' args < "$RUNNER_TEMP/hygiene/args"
-          node .hygiene-tool/scripts/hygiene-check.mjs "${args[@]}"
+          # A secret, not a variable: secrets are masked in the public log.
+          HYGIENE_ALLOWED_IDENTITIES: ${{ secrets.HYGIENE_ALLOWED_IDENTITIES }}
+        run: node .hygiene-tool/scripts/gate.mjs scan "$RUNNER_TEMP/hygiene"
 
       - name: Install gitleaks
         if: ${{ !cancelled() && env.BASE_SHA != '' }}
@@ -154,14 +80,9 @@ jobs:
         if: ${{ !cancelled() && env.BASE_SHA != '' }}
         run: |
           set -euo pipefail
+          # --text: a .gitattributes "-diff"/"binary" in the change must not hide content
           gitleaks git target \
-            --log-opts="$BASE_SHA..$HEAD_SHA" \
+            --log-opts="--text $BASE_SHA..$HEAD_SHA" \
             --config "$RUNNER_TEMP/gitleaks/config.toml" \
             --gitleaks-ignore-path "$RUNNER_TEMP/gitleaks/empty.gitleaksignore" \
             --redact --no-banner --exit-code 1
-
-      - name: Require denylist for same-repository changes
-        if: ${{ !cancelled() && steps.scan.outputs.configured == 'false' && env.IS_FORK != 'true' && env.IS_DEPENDABOT != 'true' }}
-        run: |
-          echo "::error::HYGIENE_DENYLIST org secret not configured"
-          exit 1
