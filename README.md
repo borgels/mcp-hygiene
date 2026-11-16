@@ -88,20 +88,23 @@ gitleaks false positives use its own `gitleaks:allow` comment.
 - `HYGIENE_DENYLIST` organisation secret, stored twice: for Actions, and for
   Dependabot (pull requests opened by Dependabot only receive Dependabot
   secrets). Set both from one file with
-  `scripts/set-denylist-secrets.sh ORG FILE`, which validates the patterns and
-  prints the rule count to compare with the run logs. Format:
+  `scripts/set-denylist-secrets.sh ORG FILE [IDENTITIES_FILE]`, which validates
+  the patterns, refuses a file without rules, prints the rule count to compare
+  with the run logs, and optionally sets `HYGIENE_ALLOWED_IDENTITIES` too. Format:
   newline-separated regular expressions, compiled with the `u` flag. A leading
   `i ` makes a pattern case-insensitive; `#` starts a comment. Patterns that
   are invalid or match the empty string stop the check with exit code 2.
 - Pull requests from forks never receive secrets and use the generic rules
-  only. Every other run fails if the secret is missing.
+  only. Every other run fails if the secret is missing or has no rules.
 - `HYGIENE_ALLOWED_EMAILS` (env) or `--allow-emails-file FILE`: addresses that
   are always allowed.
 - `HYGIENE_ALLOWED_IDENTITIES` organisation secret (Actions and Dependabot,
   optional): exact commit author/committer e-mail addresses, separated by
-  commas or whitespace, case-insensitive. In the commit identity fields these
-  addresses get the generic rules only; the same address in file content,
-  commit messages or pull request text is still checked with every rule.
+  commas or whitespace, case-insensitive. These addresses get the generic
+  rules only in the commit author/committer fields and in `Signed-off-by:` /
+  `Co-authored-by:` trailer lines that carry them; the same address in file
+  content, other message lines or pull request text is still checked with
+  every rule.
 - The workflow runs `scripts/` from this repository at `SCANNER_SHA`. After a
   change there, bump it in `.github/workflows/hygiene.yml`; CI warns on pull
   requests and fails on `main` while they differ.
