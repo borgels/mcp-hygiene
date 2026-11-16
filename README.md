@@ -97,6 +97,11 @@ gitleaks false positives use its own `gitleaks:allow` comment.
   only. Every other run fails if the secret is missing.
 - `HYGIENE_ALLOWED_EMAILS` (env) or `--allow-emails-file FILE`: addresses that
   are always allowed.
+- `HYGIENE_ALLOWED_IDENTITIES` organisation secret (Actions and Dependabot,
+  optional): exact commit author/committer e-mail addresses, separated by
+  commas or whitespace, case-insensitive. In the commit identity fields these
+  addresses get the generic rules only; the same address in file content,
+  commit messages or pull request text is still checked with every rule.
 - The workflow runs `scripts/` from this repository at `SCANNER_SHA`. After a
   change there, bump it in `.github/workflows/hygiene.yml`; CI warns on pull
   requests and fails on `main` while they differ.

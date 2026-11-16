@@ -39,7 +39,7 @@ function commit(dir, files, msg = 'change') {
 }
 
 function gate({ dir, base, head, title = 'Update', body = 'Neutral text.', headRef = 'feature/x', fork = false,
-  dependabot = false, denylist = DENYLIST }) {
+  dependabot = false, denylist = DENYLIST, allowedIdentities = '' }) {
   const work = mkdtempSync(join(tmpdir(), 'gate-run-'));
   const eventPath = join(work, 'event.json');
   writeFileSync(eventPath, JSON.stringify({
@@ -56,7 +56,7 @@ function gate({ dir, base, head, title = 'Update', body = 'Neutral text.', headR
     ...process.env, ...GIT_ENV,
     GITHUB_EVENT_NAME: 'pull_request', GITHUB_EVENT_PATH: eventPath, GITHUB_REPOSITORY: 'org/repo',
     GITHUB_ACTOR: dependabot ? 'dependabot[bot]' : 'someone', GITHUB_HEAD_REF: headRef, GITHUB_ENV: envFile,
-    HYGIENE_DENYLIST: denylist,
+    HYGIENE_DENYLIST: denylist, HYGIENE_ALLOWED_IDENTITIES: allowedIdentities,
   };
   delete env.GITHUB_ACTIONS;
   const out = join(work, 'out');
@@ -168,4 +168,45 @@ test('a path with a space (TAB after the +++ header) is handled once and withhel
   assert.match(r.log, /<path #1>:1 {2}email-address/);
   assert.ok(!/acme/.test(r.log), r.log);
   assert.ok(!/<path #2>/.test(r.log), 'path counted once');
+});
+
+const ORG_MAIL = `maintainer${AT}acme-internal.example`;
+
+function authored(dir, files, msg, email = ORG_MAIL) {
+  for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
+  sh(dir, 'add', '-A');
+  const r = spawnSync('git', ['-C', dir, 'commit', '-qm', msg], {
+    env: { ...process.env, ...GIT_ENV, GIT_AUTHOR_EMAIL: email, GIT_COMMITTER_EMAIL: email },
+  });
+  assert.equal(r.status, 0);
+  return sh(dir, 'rev-parse', 'HEAD');
+}
+
+test('allowed identities: identity fields exempt from the denylist (case-insensitive)', () => {
+  const { dir, base } = repo();
+  const head = authored(dir, { 'b.txt': 'x\n' }, 'update');
+  const without = gate({ dir, base, head });
+  assert.equal(without.code, 1);
+  assert.match(without.log, /commit-email:\d+ {2}internal-term #1/);
+  const withList = gate({ dir, base, head, allowedIdentities: `other${AT}example.com, ${ORG_MAIL.toUpperCase()}` });
+  assert.equal(withList.code, 0, withList.log);
+  assert.match(withList.log, /1 commit identity address\(es\) on the allowlist/);
+});
+
+test('allowed identities: the same address in content and messages is still caught', () => {
+  const { dir, base } = repo();
+  const head = authored(dir, { 'c.txt': `contact ${ORG_MAIL}\n` }, `mail ${ORG_MAIL}`);
+  const r = gate({ dir, base, head, allowedIdentities: ORG_MAIL });
+  assert.equal(r.code, 1);
+  assert.match(r.log, /c\.txt:1 {2}internal-term #1/);
+  assert.match(r.log, /commit-[0-9a-f]{12}:1 {2}internal-term #1/);
+  assert.ok(!/commit-email:/.test(r.log), 'identity field is exempt');
+});
+
+test('allowed identities still get the generic rules', () => {
+  const { dir, base } = repo();
+  const head = authored(dir, { 'b.txt': 'x\n' }, 'x', PERSONAL);
+  const r = gate({ dir, base, head, allowedIdentities: PERSONAL });
+  assert.equal(r.code, 1);
+  assert.match(r.log, /commit-email-allowed:\d+ {2}email-address/);
 });

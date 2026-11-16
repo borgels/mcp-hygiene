@@ -14,6 +14,11 @@
 //     Runs hygiene-check.mjs on the collected files. Without the denylist,
 //     pull requests from forks (which never receive secrets) get the generic
 //     rules only; every other run fails.
+//     HYGIENE_ALLOWED_IDENTITIES (optional; exact e-mail addresses separated
+//     by commas or whitespace, case-insensitive): commit author/committer
+//     addresses in this list are checked with the generic rules only. This
+//     applies to the identity fields alone; the same address in file content,
+//     commit messages or PR text is still checked with every rule.
 //
 // Exit codes: 0 clean, 1 findings or missing denylist, 2 error.
 
@@ -125,6 +130,7 @@ function scan(out) {
   if (!configured && meta.fork) {
     console.log('::notice::Pull request from a fork: secrets are not available, running generic checks only.');
   }
+  splitAllowedIdentities(out, args);
   const r = spawnSync(process.execPath, [join(HERE, 'hygiene-check.mjs'), ...args], { stdio: 'inherit', env: process.env });
   if (r.status === null) fail(`scanner did not run (${r.error?.code ?? r.signal})`);
   if (!configured && !meta.fork) {
@@ -133,4 +139,22 @@ function scan(out) {
     process.exit(r.status === 0 ? 1 : r.status);
   }
   process.exit(r.status);
+}
+
+// Moves allowed author/committer addresses out of the all-rules identity file
+// into one checked with the generic rules only.
+function splitAllowedIdentities(out, args) {
+  const allowed = new Set((process.env.HYGIENE_ALLOWED_IDENTITIES ?? '')
+    .split(/[\s,]+/).map(s => s.trim().toLowerCase()).filter(Boolean));
+  if (allowed.size === 0) return;
+  const file = join(out, 'identity-emails.txt');
+  const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
+  const keep = lines.filter(l => !allowed.has(l.trim().toLowerCase()));
+  const exempt = lines.filter(l => allowed.has(l.trim().toLowerCase()));
+  writeFileSync(file, keep.join('\n'));
+  if (exempt.length === 0) return;
+  const exemptFile = join(out, 'identity-emails-allowed.txt');
+  writeFileSync(exemptFile, exempt.join('\n'));
+  args.push('--rules', 'generic', '--label', 'commit-email-allowed', '--text', exemptFile);
+  console.log(`${exempt.length} commit identity address(es) on the allowlist: generic rules only`);
 }
