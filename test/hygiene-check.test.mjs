@@ -172,7 +172,7 @@ test('--rules generic skips the denylist for the inputs that follow', () => {
 test('hygiene:allow hits are listed, private keys cannot be allowed', () => {
   const r = text(`x ${PERSONAL} hygiene:allow`);
   assert.equal(r.code, 0);
-  assert.match(r.err, /1 hit\(s\) skipped by hygiene:allow:\n {2}body:1 {2}email-address/);
+  assert.match(r.err, /1 hit\(s\) skipped by hygiene:allow:\n {2}- body:1 {2}email-address/);
   const key = ['-----BEGIN', 'PRIVATE KEY-----'].join(' ');
   assert.equal(text(`${key} hygiene:allow`).code, 1);
 });

@@ -8,15 +8,21 @@ of public repositories.
 On every pull request (and merge queue entry) the `public-hygiene` job scans:
 
 - the lines **added** by the change, both the net diff (`base...head`) and each
-  individual commit, so a value added in one commit and removed in a later one
-  is still found,
+  individual commit (merge commits via `--remerge-diff`), so a value added in
+  one commit and removed in a later one is still found,
 - the paths of all added, modified, renamed and copied files, including binary
   and empty files,
 - every commit message in `base..head`, the commit author and committer
   e-mail addresses (names: generic rules only), and the branch name,
 - the pull request title and body,
 - the commit range with [gitleaks](https://github.com/gitleaks/gitleaks)
-  (built-in rules, pinned and checksum-verified).
+  (built-in rules, pinned and checksum-verified, binary-looking files as text).
+
+The workflow is thin: [`scripts/gate.mjs`](scripts/gate.mjs) collects the text
+to check (`collect`, no secrets) and runs the scanner (`scan`); both are
+pinned with the scanner and covered by the tests in `test/`. The pull request
+title and body are read from the event file, so they are not repeated in the
+logged step environment.
 
 The scanner, [`scripts/hygiene-check.mjs`](scripts/hygiene-check.mjs) (Node 20+,
 no dependencies), has two rule sets:
@@ -27,12 +33,14 @@ no dependencies), has two rule sets:
 | Internal terms | `HYGIENE_DENYLIST` secret | organisation-specific names and hosts, one regular expression per line |
 
 Findings for internal terms are reported by rule number only; the matched text
-is never printed, and a file path that matches is shown as `<path #N>` (the
-N-th distinct path checked, in `git diff --name-status` order). Generic
+is never printed. A file path that matches any rule is shown as `<path #N>`
+(the N-th distinct path checked, in `git diff --name-status` order). Generic
 findings are shown masked. Lockfiles are checked with internal-term rules only.
 
-Not covered: the content of binary files (images, PDFs, office documents),
-text in other encodings such as UTF-16, and text typed into the merge dialog.
+Binary files are read as text (`git diff --text`), so plain strings inside them
+are found. Not covered: compressed or encoded content (images, PDFs, office
+documents, base64), text in other encodings such as UTF-16, and text typed into
+the merge dialog.
 
 ## The check runs after publication
 
@@ -42,14 +50,15 @@ title/body edits keep a revision history. After a finding:
 
 1. remove the value (amend or rebase the commits, edit the title/body),
 2. delete the old revision from the title/body edit history,
-3. if it matters, delete the workflow run log and ask GitHub Support to purge
-   the pull request ref.
+3. delete the logs of all workflow runs of the pull request (every run on
+   open, edit and push scanned the text again), and if it matters ask GitHub
+   Support to purge the pull request ref.
 
 Running the scanner locally before pushing is the only real prevention:
 
 ```sh
 git diff origin/main...HEAD | node scripts/hygiene-check.mjs --denylist ~/denylist.txt --diff -
-git log -p --format='commit %H' origin/main..HEAD | node scripts/hygiene-check.mjs --denylist ~/denylist.txt --diff -
+git log -p --text --remerge-diff --format='commit %H' origin/main..HEAD | node scripts/hygiene-check.mjs --denylist ~/denylist.txt --diff -
 node scripts/hygiene-check.mjs --denylist ~/denylist.txt --label notes --text notes.md
 ```
 
@@ -69,25 +78,28 @@ code comment:
 const SUPPORT = 'support@vendor.dev'; // hygiene:allow (vendor contact from public docs)
 ```
 
-Lines containing the marker are skipped by every rule except `private-key`.
-Skipped hits are still listed in the job log (location and rule only). For
+Lines containing the marker are skipped by every rule except `private-key`; the
+marker has no effect on file paths. Skipped hits are listed in the job log
+(location and rule only) and counted in a warning on the checks page. For
 gitleaks false positives use its own `gitleaks:allow` comment.
 
 ## Configuration
 
-- `HYGIENE_DENYLIST` organisation secret (Actions, and Dependabot for
-  Dependabot pull requests): newline-separated regular expressions, compiled
-  with the `u` flag. A leading `i ` makes a pattern case-insensitive; `#`
-  starts a comment. Patterns that are invalid or match the empty string stop
-  the check with exit code 2.
-- Pull requests from forks, and Dependabot runs without the secret, use the
-  generic rules only; other same-repository changes fail if the secret is
-  missing.
+- `HYGIENE_DENYLIST` organisation secret, stored twice: for Actions, and for
+  Dependabot (pull requests opened by Dependabot only receive Dependabot
+  secrets). Set both from one file with
+  `scripts/set-denylist-secrets.sh ORG FILE`, which validates the patterns and
+  prints the rule count to compare with the run logs. Format:
+  newline-separated regular expressions, compiled with the `u` flag. A leading
+  `i ` makes a pattern case-insensitive; `#` starts a comment. Patterns that
+  are invalid or match the empty string stop the check with exit code 2.
+- Pull requests from forks never receive secrets and use the generic rules
+  only. Every other run fails if the secret is missing.
 - `HYGIENE_ALLOWED_EMAILS` (env) or `--allow-emails-file FILE`: addresses that
   are always allowed.
-- The workflow runs the scanner from this repository at `SCANNER_SHA`. After a
-  scanner change, bump it in `.github/workflows/hygiene.yml`; CI warns while
-  they differ.
+- The workflow runs `scripts/` from this repository at `SCANNER_SHA`. After a
+  change there, bump it in `.github/workflows/hygiene.yml`; CI warns on pull
+  requests and fails on `main` while they differ.
 
 ## License
 
