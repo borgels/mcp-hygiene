@@ -1,0 +1,157 @@
+# Public-text hygiene gate. Intended to run as an organisation ruleset
+# required workflow on public repositories; it also runs on this repository.
+# It checks added diff lines, commit messages and the pull request title/body
+# with scripts/hygiene-check.mjs, and the commit range with gitleaks.
+name: public-hygiene
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  merge_group:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  public-hygiene:
+    name: public-hygiene
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # Scanner revision in borgels/mcp-hygiene. Bump after changing the scanner.
+      SCANNER_REPO: borgels/mcp-hygiene
+      SCANNER_SHA: __SCANNER_SHA__
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - name: Check out target repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: target
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out scanner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SCANNER_REPO }}
+          ref: ${{ env.SCANNER_SHA }}
+          path: .hygiene-tool
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Resolve commit range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = merge_group ]; then
+            base=$MG_BASE head=$MG_HEAD fork=false
+          else
+            base=$PR_BASE head=$PR_HEAD
+            if [ "$PR_HEAD_REPO" = "$REPO" ]; then fork=false; else fork=true; fi
+          fi
+          git -C target cat-file -e "$base^{commit}" 2>/dev/null || git -C target fetch --no-tags origin "$base"
+          git -C target cat-file -e "$head^{commit}"
+          {
+            echo "BASE_SHA=$base"
+            echo "HEAD_SHA=$head"
+            echo "IS_FORK=$fork"
+          } >> "$GITHUB_ENV"
+          echo "Range $base..$head (fork: $fork)"
+
+      - name: Check denylist availability
+        id: denylist
+        env:
+          HYGIENE_DENYLIST: ${{ secrets.HYGIENE_DENYLIST }}
+        run: |
+          if [ -n "${HYGIENE_DENYLIST//[[:space:]]/}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          elif [ "$IS_FORK" = true ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Pull request from a fork: secrets are not available, running generic checks only."
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::HYGIENE_DENYLIST org secret not configured; generic checks run, the job will fail at the end."
+          fi
+
+      - name: Scan added lines
+        if: ${{ !cancelled() && env.BASE_SHA != '' }}
+        env:
+          HYGIENE_DENYLIST: ${{ secrets.HYGIENE_DENYLIST }}
+        run: |
+          set -euo pipefail
+          git -C target diff --no-color --no-ext-diff --find-renames "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changes.diff"
+          node .hygiene-tool/scripts/hygiene-check.mjs --diff "$RUNNER_TEMP/changes.diff"
+
+      - name: Scan commit messages
+        if: ${{ !cancelled() && env.BASE_SHA != '' }}
+        env:
+          HYGIENE_DENYLIST: ${{ secrets.HYGIENE_DENYLIST }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/commits"; mkdir -p "$dir"
+          args=()
+          for sha in $(git -C target rev-list "$BASE_SHA..$HEAD_SHA"); do
+            git -C target log -1 --format=%B "$sha" > "$dir/$sha.txt"
+            args+=(--label "commit-${sha:0:12}" --text "$dir/$sha.txt")
+          done
+          if [ ${#args[@]} -eq 0 ]; then echo "No commits in range."; exit 0; fi
+          node .hygiene-tool/scripts/hygiene-check.mjs "${args[@]}"
+
+      - name: Scan pull request title and body
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          HYGIENE_DENYLIST: ${{ secrets.HYGIENE_DENYLIST }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$PR_TITLE" > "$RUNNER_TEMP/pr-title.txt"
+          printf '%s\n' "$PR_BODY" > "$RUNNER_TEMP/pr-body.txt"
+          node .hygiene-tool/scripts/hygiene-check.mjs \
+            --label pr-title --text "$RUNNER_TEMP/pr-title.txt" \
+            --label pr-body --text "$RUNNER_TEMP/pr-body.txt"
+
+      - name: Install gitleaks
+        if: ${{ !cancelled() && env.BASE_SHA != '' }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/gitleaks"; mkdir -p "$dir"
+          tgz="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$dir/$tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$tgz"
+          echo "$GITLEAKS_SHA256  $dir/$tgz" | sha256sum -c -
+          tar -xzf "$dir/$tgz" -C "$dir" gitleaks
+          # Built-in rules only: a pull request cannot relax them with its own
+          # .gitleaks.toml or .gitleaksignore.
+          printf '[extend]\nuseDefault = true\n' > "$dir/config.toml"
+          : > "$dir/empty.gitleaksignore"
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: Scan commit range for secrets
+        if: ${{ !cancelled() && env.BASE_SHA != '' }}
+        run: |
+          set -euo pipefail
+          gitleaks git target \
+            --log-opts="$BASE_SHA..$HEAD_SHA" \
+            --config "$RUNNER_TEMP/gitleaks/config.toml" \
+            --gitleaks-ignore-path "$RUNNER_TEMP/gitleaks/empty.gitleaksignore" \
+            --redact --no-banner --exit-code 1
+
+      - name: Require denylist for same-repository changes
+        if: ${{ !cancelled() && steps.denylist.outputs.configured == 'false' && env.IS_FORK != 'true' }}
+        run: |
+          echo "::error::HYGIENE_DENYLIST org secret not configured"
+          exit 1
