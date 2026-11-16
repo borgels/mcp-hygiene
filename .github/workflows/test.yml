@@ -27,5 +27,27 @@ jobs:
         run: |
           set -euo pipefail
           args=()
-          for f in $(git ls-files); do args+=(--label "$f" --text "$f"); done
+          while IFS= read -r -d '' f; do args+=(--label "$f" --text "$f"); done < <(git ls-files -z)
           node scripts/hygiene-check.mjs "${args[@]}"
+
+  scanner-pin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Pinned scanner matches this revision
+        run: |
+          set -euo pipefail
+          sha=$(sed -nE 's/^ *SCANNER_SHA: *([0-9a-f]{40}).*/\1/p' .github/workflows/hygiene.yml)
+          if [ -z "$sha" ]; then echo "::error::SCANNER_SHA not found in hygiene.yml"; exit 1; fi
+          git cat-file -e "$sha^{commit}" || { echo "::error::SCANNER_SHA $sha is not in this repository"; exit 1; }
+          git merge-base --is-ancestor "$sha" origin/main || echo "::warning::SCANNER_SHA $sha is not on main"
+          if git diff --quiet "$sha" HEAD -- scripts/; then
+            echo "scripts/ at SCANNER_SHA $sha equal this revision"
+          else
+            echo "::warning::scripts/ differ from SCANNER_SHA $sha; bump SCANNER_SHA in hygiene.yml after merging"
+            git diff --stat "$sha" HEAD -- scripts/
+          fi
