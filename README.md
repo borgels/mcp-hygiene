@@ -68,3 +68,5 @@ Exit codes: `0` clean, `1` findings, `2` usage or configuration error.
 ## License
 
 Apache-2.0
+
+Contributions are welcome via pull request.
