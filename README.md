@@ -7,9 +7,13 @@ of public repositories.
 
 On every pull request (and merge queue entry) the `public-hygiene` job scans:
 
-- the lines **added** by the change (`git diff base...head`), including new and
-  renamed file paths,
-- every commit message in `base..head`,
+- the lines **added** by the change, both the net diff (`base...head`) and each
+  individual commit, so a value added in one commit and removed in a later one
+  is still found,
+- the paths of all added, modified, renamed and copied files, including binary
+  and empty files,
+- every commit message in `base..head`, the commit author and committer
+  e-mail addresses (names: generic rules only), and the branch name,
 - the pull request title and body,
 - the commit range with [gitleaks](https://github.com/gitleaks/gitleaks)
   (built-in rules, pinned and checksum-verified).
@@ -23,18 +27,38 @@ no dependencies), has two rule sets:
 | Internal terms | `HYGIENE_DENYLIST` secret | organisation-specific names and hosts, one regular expression per line |
 
 Findings for internal terms are reported by rule number only; the matched text
-is never printed. Generic findings are shown masked.
+is never printed, and a file path that matches is shown as `<path #N>` (the
+N-th distinct path checked, in `git diff --name-status` order). Generic
+findings are shown masked. Lockfiles are checked with internal-term rules only.
 
-A scheduled workflow (`daily-public-scan`) scans issues, pull requests,
-comments, reviews and releases created or updated in all public repositories
-during the last 48 hours, and fails if anything matches.
+Not covered: the content of binary files (images, PDFs, office documents),
+text in other encodings such as UTF-16, and text typed into the merge dialog.
+
+## The check runs after publication
+
+A pull request is public as soon as it is opened. A red check prevents the
+merge, but the pushed commits stay reachable through the pull request, and
+title/body edits keep a revision history. After a finding:
+
+1. remove the value (amend or rebase the commits, edit the title/body),
+2. delete the old revision from the title/body edit history,
+3. if it matters, delete the workflow run log and ask GitHub Support to purge
+   the pull request ref.
+
+Running the scanner locally before pushing is the only real prevention:
+
+```sh
+git diff origin/main...HEAD | node scripts/hygiene-check.mjs --denylist ~/denylist.txt --diff -
+git log -p --format='commit %H' origin/main..HEAD | node scripts/hygiene-check.mjs --denylist ~/denylist.txt --diff -
+node scripts/hygiene-check.mjs --denylist ~/denylist.txt --label notes --text notes.md
+```
+
+Exit codes: `0` clean, `1` findings, `2` usage or configuration error.
 
 ## Fixing a finding
 
 Replace the value with a neutral placeholder: `user@example.com`,
 `192.0.2.10`, `<tenant-id>`, `/path/to/project`, or generic wording.
-Commit messages can be fixed with `git rebase` / `git commit --amend`,
-the PR title and body by editing them (the check re-runs on edit).
 
 ## Marking a false positive
 
@@ -45,25 +69,25 @@ code comment:
 const SUPPORT = 'support@vendor.dev'; // hygiene:allow (vendor contact from public docs)
 ```
 
-Lines containing the marker are skipped by every rule. For gitleaks false
-positives use its own `gitleaks:allow` comment.
-
-## Running locally
-
-```sh
-git diff origin/main...HEAD | node scripts/hygiene-check.mjs --diff -
-node scripts/hygiene-check.mjs --label notes --text notes.md --denylist ~/denylist.txt
-```
-
-Exit codes: `0` clean, `1` findings, `2` usage or configuration error.
+Lines containing the marker are skipped by every rule except `private-key`.
+Skipped hits are still listed in the job log (location and rule only). For
+gitleaks false positives use its own `gitleaks:allow` comment.
 
 ## Configuration
 
-- `HYGIENE_DENYLIST` organisation secret: newline-separated regular expressions.
-  A leading `i ` makes a pattern case-insensitive; `#` starts a comment.
-  Pull requests from forks do not receive secrets and run the generic rules
-  only; same-repository changes fail if the secret is missing.
-- `HYGIENE_ALLOWED_EMAILS` (optional env): addresses that are always allowed.
+- `HYGIENE_DENYLIST` organisation secret (Actions, and Dependabot for
+  Dependabot pull requests): newline-separated regular expressions, compiled
+  with the `u` flag. A leading `i ` makes a pattern case-insensitive; `#`
+  starts a comment. Patterns that are invalid or match the empty string stop
+  the check with exit code 2.
+- Pull requests from forks, and Dependabot runs without the secret, use the
+  generic rules only; other same-repository changes fail if the secret is
+  missing.
+- `HYGIENE_ALLOWED_EMAILS` (env) or `--allow-emails-file FILE`: addresses that
+  are always allowed.
+- The workflow runs the scanner from this repository at `SCANNER_SHA`. After a
+  scanner change, bump it in `.github/workflows/hygiene.yml`; CI warns while
+  they differ.
 
 ## License
 
