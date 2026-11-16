@@ -39,6 +39,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Pinned scanner matches this revision
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           sha=$(sed -nE 's/^ *SCANNER_SHA: *([0-9a-f]{40}).*/\1/p' .github/workflows/hygiene.yml)
@@ -48,6 +50,10 @@ jobs:
           if git diff --quiet "$sha" HEAD -- scripts/; then
             echo "scripts/ at SCANNER_SHA $sha equal this revision"
           else
-            echo "::warning::scripts/ differ from SCANNER_SHA $sha; bump SCANNER_SHA in hygiene.yml after merging"
             git diff --stat "$sha" HEAD -- scripts/
+            if [ "$EVENT" = push ]; then
+              echo "::error::scripts/ on main differ from SCANNER_SHA $sha; bump SCANNER_SHA in hygiene.yml"
+              exit 1
+            fi
+            echo "::warning::scripts/ differ from SCANNER_SHA $sha; bump SCANNER_SHA in hygiene.yml after merging"
           fi

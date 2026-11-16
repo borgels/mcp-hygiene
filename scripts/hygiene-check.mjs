@@ -21,10 +21,11 @@
 // Denylist format: one regular expression per line; a leading "i " makes it
 // case-insensitive; blank lines and lines starting with "#" are ignored.
 // Text matched by a denylist pattern is never printed: findings show the rule
-// number only, and a path that matches is replaced by "<path #N>".
+// number only, and a path that matches any rule is replaced by "<path #N>".
 //
 // A line containing "hygiene:allow" is skipped by every rule except
-// private-key; skipped hits are listed (location and rule only).
+// private-key; skipped hits are listed (location and rule only). The marker
+// has no effect on file paths.
 // Lockfiles are checked with denylist rules only.
 //
 // Exit codes: 0 clean, 1 findings, 2 usage/config error.
@@ -165,10 +166,12 @@ function ipFinding(m, line, index) {
   return true;
 }
 
+// Exempt only these exact account names (placeholders, CI and container users).
+const GENERIC_ACCOUNTS = 'runner|runneradmin|user|username|me|you|node|app|appuser|ubuntu|public|default';
+const POSIX_GENERIC = new RegExp(`^/(?:Users|home)/(?:${GENERIC_ACCOUNTS})/$`, 'i');
+const WINDOWS_GENERIC = new RegExp(`Users[\\\\/]+(?:(?:${GENERIC_ACCOUNTS})$|<)`, 'i');
 function homePathFinding(m) {
-  if (/^\/(Users|home)\/(runner|user|username|me|you|node|app[\w.-]*|ubuntu)\//i.test(m)) return false;
-  if (/Users[\\/]+(user|username|me|you|runneradmin|public|default|<)/i.test(m)) return false;
-  return true;
+  return !(m.startsWith('/') ? POSIX_GENERIC.test(m) : WINDOWS_GENERIC.test(m));
 }
 
 const genericRules = [
@@ -191,8 +194,8 @@ const findings = [];
 const suppressed = [];
 
 // Returns the matching rules; records findings unless dryRun.
-function scanLine(line, where, sc, { dryRun = false } = {}) {
-  const allowed = line.includes('hygiene:allow');
+function scanLine(line, where, sc, { dryRun = false, allowMarker = true } = {}) {
+  const allowed = allowMarker && line.includes('hygiene:allow');
   const hits = [];
   for (const rule of rules) {
     if (rule.secret ? !sc.internal : !sc.generic) continue;
@@ -217,13 +220,13 @@ function scanLine(line, where, sc, { dryRun = false } = {}) {
   return hits;
 }
 
-// ---- paths: checked once each; a path that matches a denylist rule is withheld ----
+// ---- paths: checked once each; a path that matches any rule is withheld ----
 const pathInfo = new Map();
 function pathEntry(p) {
   let e = pathInfo.get(p);
   if (!e) {
-    e = { n: pathInfo.size + 1, withheld: scanLine(p, '', SCOPES.internal, { dryRun: true }).length > 0 };
-    e.display = e.withheld ? `<path #${e.n}>` : p;
+    const hit = scanLine(p, '', SCOPES.all, { dryRun: true, allowMarker: false }).length > 0;
+    e = { n: pathInfo.size + 1, withheld: hit, display: hit ? `<path #${pathInfo.size + 1}>` : p };
     pathInfo.set(p, e);
   }
   return e;
@@ -232,7 +235,8 @@ const scannedPaths = new Set();
 function scanPath(p, sc) {
   if (!p || p === '/dev/null' || scannedPaths.has(p)) return;
   scannedPaths.add(p);
-  scanLine(p, `${pathEntry(p).display}:path`, sc);
+  // a file name cannot exempt itself with the allow marker
+  scanLine(p, `${pathEntry(p).display}:path`, sc, { allowMarker: false });
 }
 
 // git quotes unusual paths as C strings unless core.quotePath=false
@@ -279,7 +283,8 @@ function scanDiff(content, sc) {
     const c = /^commit ([0-9a-f]{7,64})\b/.exec(l);
     if (c) { commit = `commit-${c[1].slice(0, 12)}:`; continue; }
     if (l.startsWith('+++ ')) {
-      file = unquote(l.slice(4)).replace(/^b\//, '');
+      // git appends a TAB to "+++ b/<path>" when the path contains a space
+      file = unquote(l.slice(4).replace(/\t$/, '')).replace(/^b\//, '');
       // lockfiles carry registry URLs and hashes: internal terms only
       fileSc = LOCKFILE.test(file) ? { generic: false, internal: sc.internal } : sc;
       scanPath(file, sc);
@@ -317,19 +322,24 @@ for (const input of inputs) {
   }
 }
 
+// Output lines start with "  - " so text from the change (a path starting
+// with "::") can never be read as a workflow command by the Actions runner.
 if (suppressed.length) {
   console.error(`hygiene-check: ${suppressed.length} hit(s) skipped by hygiene:allow:`);
-  for (const s of suppressed) console.error(`  ${s.where}  ${s.rule}`);
+  for (const s of suppressed) console.error(`  - ${s.where}  ${s.rule}`);
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    console.log(`::warning title=hygiene::${suppressed.length} hit(s) skipped by hygiene:allow (see log)`);
+  }
 }
 if ([...pathInfo.values()].some(e => e.withheld)) {
-  console.error('hygiene-check: <path #N> is the N-th distinct path checked; its name matches an internal term.');
+  console.error('hygiene-check: <path #N> is the N-th distinct path checked; its name matches a rule.');
 }
 if (findings.length === 0) {
   console.log(`hygiene-check: clean (${denyRules.length} internal-term rules, ${genericRules.length} generic rules)`);
   process.exit(0);
 }
 console.error(`hygiene-check: ${findings.length} finding(s) in text that would become public:`);
-for (const f of findings) console.error(`  ${f.where}  ${f.rule}${f.shown}`);
+for (const f of findings) console.error(`  - ${f.where}  ${f.rule}${f.shown}`);
 console.error('Remove or neutralise these (use example.com, <placeholder>, generic wording).');
 console.error('If a line is a deliberate false positive, add "hygiene:allow" to it.');
 process.exit(1);
