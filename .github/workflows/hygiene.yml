@@ -24,7 +24,7 @@ jobs:
     env:
       # Revision of scripts/ in borgels/mcp-hygiene. Bump after changing scripts/.
       SCANNER_REPO: borgels/mcp-hygiene
-      SCANNER_SHA: f8f9ea27ba8a91a3010a24d438e9ade1bf3bcbbe
+      SCANNER_SHA: 7a60cc29959b849b0f65977de82719d0d15232e1
       GITLEAKS_VERSION: 8.30.1
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
@@ -33,7 +33,9 @@ jobs:
         with:
           path: target
           ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
-          fetch-depth: 0
+          # Shallow on purpose: gate.mjs fetches the history of the base and
+          # head commits only, so other branch names never appear in the log.
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Check out scanner
