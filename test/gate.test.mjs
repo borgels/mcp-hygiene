@@ -190,7 +190,7 @@ test('allowed identities: identity fields exempt from the denylist (case-insensi
   assert.match(without.log, /commit-email:\d+ {2}internal-term #1/);
   const withList = gate({ dir, base, head, allowedIdentities: `other${AT}example.com, ${ORG_MAIL.toUpperCase()}` });
   assert.equal(withList.code, 0, withList.log);
-  assert.match(withList.log, /1 commit identity address\(es\) on the allowlist/);
+  assert.match(withList.log, /identity allowlist: 1 commit address\(es\), 0 trailer line\(s\)/);
 });
 
 test('allowed identities: the same address in content and messages is still caught', () => {
@@ -209,4 +209,91 @@ test('allowed identities still get the generic rules', () => {
   const r = gate({ dir, base, head, allowedIdentities: PERSONAL });
   assert.equal(r.code, 1);
   assert.match(r.log, /commit-email-allowed:\d+ {2}email-address/);
+});
+
+test('allowed identities: sign-off and co-author trailers with the address are exempt', () => {
+  const { dir, base } = repo();
+  const msg = [
+    'Update docs',
+    '',
+    `Signed-off-by: Maintainer <${ORG_MAIL}>`,
+    `Co-authored-by: Maintainer <${ORG_MAIL.toUpperCase()}>`,
+  ].join('\n');
+  const head = authored(dir, { 'b.txt': 'x\n' }, msg);
+  const without = gate({ dir, base, head });
+  assert.equal(without.code, 1);
+  assert.match(without.log, /commit-[0-9a-f]{12}:3 {2}internal-term #1/);
+  const r = gate({ dir, base, head, allowedIdentities: ORG_MAIL });
+  assert.equal(r.code, 0, r.log);
+  assert.match(r.log, /1 commit address\(es\), 2 trailer line\(s\)/);
+  // exempt trailer locations are listed, the lines themselves are not
+  assert.match(r.log, /- commit-[0-9a-f]{12}:3 {2}trailer \(generic rules only\)/);
+  assert.match(r.log, /- commit-[0-9a-f]{12}:4 {2}trailer \(generic rules only\)/);
+  assert.ok(!r.log.includes(ORG_MAIL), 'trailer text is not printed');
+});
+
+test('allowed identities: trailer exemption cannot carry other text or addresses', () => {
+  const { dir, base } = repo();
+  const msg = [
+    'Update',
+    '',
+    // second address riding along with the allowlisted one
+    `Co-authored-by: X <other${AT}acme-internal.example> <${ORG_MAIL}>`,
+    // indented, and a space before the colon
+    `  Signed-off-by: acme-internal <${ORG_MAIL}>`,
+    `Signed-off-by : acme-internal <${ORG_MAIL}>`,
+    // long free text in the name part
+    `Co-authored-by: ${'acme-internal notes '.repeat(6)}<${ORG_MAIL}>`,
+    // control: a plain trailer with a non-ASCII name stays exempt
+    `Co-authored-by: Søren Ærbø <${ORG_MAIL}>`,
+  ].join('\n');
+  const head = authored(dir, { 'b.txt': 'x\n' }, msg);
+  const r = gate({ dir, base, head, allowedIdentities: ORG_MAIL });
+  assert.equal(r.code, 1);
+  for (const line of [3, 4, 5, 6]) assert.match(r.log, new RegExp(`commit-[0-9a-f]{12}:${line} {2}internal-term #1`));
+  assert.match(r.log, /1 commit address\(es\), 1 trailer line\(s\)/);
+  assert.match(r.log, /- commit-[0-9a-f]{12}:7 {2}trailer \(generic rules only\)/);
+});
+
+test('allowed identities: other lines, other trailers and other addresses are still checked', () => {
+  const { dir, base } = repo();
+  const msg = [
+    `Mention ${ORG_MAIL} in the text`,
+    '',
+    `Reviewed-by: Maintainer <${ORG_MAIL}>`,
+    `Signed-off-by: Someone <other${AT}acme-internal.example>`,
+    `Co-authored-by: Maintainer <${ORG_MAIL}> acme-internal`,
+    `Signed-off-by: Maintainer <${ORG_MAIL}>`,
+  ].join('\n');
+  const head = authored(dir, { 'b.txt': 'x\n' }, msg);
+  const r = gate({ dir, base, head, allowedIdentities: ORG_MAIL });
+  assert.equal(r.code, 1);
+  for (const line of [1, 3, 4, 5]) assert.match(r.log, new RegExp(`commit-[0-9a-f]{12}:${line} {2}internal-term #1`));
+  assert.ok(!/commit-[0-9a-f]{12}:6 {2}internal-term/.test(r.log), 'the allowlisted sign-off is exempt');
+});
+
+test('a denylist with only comments counts as missing', () => {
+  const { dir, base } = repo();
+  const head = commit(dir, { 'b.txt': 'hello\n' });
+  const r = gate({ dir, base, head, denylist: '# placeholder\n\n' });
+  assert.equal(r.code, 1);
+  assert.match(r.log, /HYGIENE_DENYLIST org secret has no rules \(Actions secret\)/);
+  const fork = gate({ dir, base, head, denylist: '# placeholder\n', fork: true });
+  assert.equal(fork.code, 0, fork.log);
+});
+
+test('shallow checkout: only the history of base and head is fetched', () => {
+  const src = repo();
+  sh(src.dir, 'config', 'uploadpack.allowAnySHA1InWant', 'true');
+  const bad = commit(src.dir, { 'b.txt': 'acme-internal\n' });
+  const head = commit(src.dir, { 'b.txt': 'clean\n' });
+  const dir = mkdtempSync(join(tmpdir(), 'gate-shallow-'));
+  const url = `file://${src.dir.replace(/\\/g, '/')}`;
+  const cl = spawnSync('git', ['clone', '-q', '--depth', '1', '--no-local', url, dir], { encoding: 'utf8', env: { ...process.env, ...GIT_ENV } });
+  assert.equal(cl.status, 0, cl.stderr);
+  assert.equal(sh(dir, 'rev-parse', '--is-shallow-repository'), 'true');
+  const r = gate({ dir, base: src.base, head });
+  assert.equal(r.code, 1, r.log);
+  assert.match(r.log, new RegExp(`commit-${bad.slice(0, 12)}:b\\.txt:1 {2}internal-term #1`));
+  assert.equal(sh(dir, 'rev-parse', '--is-shallow-repository'), 'false');
 });

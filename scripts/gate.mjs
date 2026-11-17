@@ -8,17 +8,19 @@
 //     commit messages, author/committer identities, branch name, PR title and
 //     body. PR text is read from the event file, never from the environment,
 //     so it does not appear in the step's logged env block.
-//     Appends BASE_SHA and HEAD_SHA to GITHUB_ENV when set.
+//     Appends BASE_SHA and HEAD_SHA to GITHUB_ENV when set. A shallow checkout
+//     is deepened by fetching the history of the base and head commits only.
 //
 //   gate.mjs scan OUT_DIR               (needs HYGIENE_DENYLIST)
-//     Runs hygiene-check.mjs on the collected files. Without the denylist,
-//     pull requests from forks (which never receive secrets) get the generic
-//     rules only; every other run fails.
+//     Runs hygiene-check.mjs on the collected files. Without a denylist that
+//     has at least one rule, pull requests from forks (which never receive
+//     secrets) get the generic rules only; every other run fails.
 //     HYGIENE_ALLOWED_IDENTITIES (optional; exact e-mail addresses separated
-//     by commas or whitespace, case-insensitive): commit author/committer
-//     addresses in this list are checked with the generic rules only. This
-//     applies to the identity fields alone; the same address in file content,
-//     commit messages or PR text is still checked with every rule.
+//     by commas or whitespace, case-insensitive): these addresses are checked
+//     with the generic rules only in the commit author/committer fields and in
+//     "Signed-off-by:" / "Co-authored-by:" trailer lines that carry them. The
+//     same address anywhere else (file content, other message lines, PR text)
+//     is still checked with every rule.
 //
 // Exit codes: 0 clean, 1 findings or missing denylist, 2 error.
 
@@ -81,7 +83,10 @@ function collect(repo, out) {
     fail(`unsupported event ${event}`);
   }
   for (const sha of [base, head]) if (!/^[0-9a-f]{40}$/.test(sha ?? '')) fail('event has no commit range');
-  if (git(repo, ['cat-file', '-e', `${base}^{commit}`], { allowFail: true }) === null) {
+  if (git(repo, ['rev-parse', '--is-shallow-repository']).trim() === 'true') {
+    // shallow checkout: fetch the history of these two commits only (no branch list)
+    git(repo, ['fetch', '--no-tags', '--quiet', '--unshallow', 'origin', base, head]);
+  } else if (git(repo, ['cat-file', '-e', `${base}^{commit}`], { allowFail: true }) === null) {
     git(repo, ['fetch', '--no-tags', '--quiet', 'origin', base]);
   }
   git(repo, ['cat-file', '-e', `${head}^{commit}`]);
@@ -105,10 +110,13 @@ function collect(repo, out) {
   const args = ['--paths', f('net.paths'), '--paths', f('commits.paths'), '--diff', f('net.diff'), '--diff', f('commits.diff'),
     '--label', 'head-ref', '--text', f('head-ref.txt'), '--label', 'commit-email', '--text', f('identity-emails.txt')];
   const shas = git(repo, ['rev-list', range]).split('\n').filter(Boolean);
+  const messages = [];
   for (const sha of shas) {
     const file = join(out, 'msg', `${sha}.txt`);
+    const label = `commit-${sha.slice(0, 12)}`;
     git(repo, ['log', '-1', '--format=%B', sha], { out: file });
-    args.push('--label', `commit-${sha.slice(0, 12)}`, '--text', file);
+    args.push('--label', label, '--text', file);
+    messages.push({ file, label });
   }
   for (const [label, text] of texts) {
     writeFileSync(f(`${label}.txt`), `${text}\n`);
@@ -118,7 +126,7 @@ function collect(repo, out) {
   args.push('--rules', 'generic', '--label', 'commit-name', '--text', f('identity-names.txt'));
 
   writeFileSync(f('args.json'), JSON.stringify(args));
-  writeFileSync(f('meta.json'), JSON.stringify({ event, base, head, fork, dependabot }));
+  writeFileSync(f('meta.json'), JSON.stringify({ event, base, head, fork, dependabot, messages }));
   if (process.env.GITHUB_ENV) appendFileSync(process.env.GITHUB_ENV, `BASE_SHA=${base}\nHEAD_SHA=${head}\n`);
   console.log(`Range ${base}..${head} (fork: ${fork}, dependabot: ${dependabot}), commits: ${shas.length}`);
 }
@@ -126,35 +134,75 @@ function collect(repo, out) {
 function scan(out) {
   const meta = JSON.parse(readFileSync(join(out, 'meta.json'), 'utf8'));
   const args = JSON.parse(readFileSync(join(out, 'args.json'), 'utf8'));
-  const configured = Boolean((process.env.HYGIENE_DENYLIST ?? '').trim());
+  // a secret that holds only comments or a placeholder is as good as none
+  const rules = internalRuleCount(out);
+  const configured = rules > 0;
   if (!configured && meta.fork) {
     console.log('::notice::Pull request from a fork: secrets are not available, running generic checks only.');
   }
-  splitAllowedIdentities(out, args);
+  applyIdentityAllowlist(out, args, meta.messages ?? []);
   const r = spawnSync(process.execPath, [join(HERE, 'hygiene-check.mjs'), ...args], { stdio: 'inherit', env: process.env });
   if (r.status === null) fail(`scanner did not run (${r.error?.code ?? r.signal})`);
   if (!configured && !meta.fork) {
     const which = meta.dependabot ? 'Dependabot' : 'Actions';
-    console.log(`::error::HYGIENE_DENYLIST org secret not configured (${which} secret)`);
+    const what = (process.env.HYGIENE_DENYLIST ?? '').trim() ? 'has no rules' : 'not configured';
+    console.log(`::error::HYGIENE_DENYLIST org secret ${what} (${which} secret)`);
     process.exit(r.status === 0 ? 1 : r.status);
   }
   process.exit(r.status);
 }
 
-// Moves allowed author/committer addresses out of the all-rules identity file
-// into one checked with the generic rules only.
-function splitAllowedIdentities(out, args) {
+function internalRuleCount(out) {
+  const empty = join(out, 'empty.txt');
+  writeFileSync(empty, '');
+  const r = spawnSync(process.execPath, [join(HERE, 'hygiene-check.mjs'), '--text', empty], { encoding: 'utf8', env: process.env });
+  if (r.status === 2) {
+    process.stderr.write(r.stderr); // configuration error: line number only, never the pattern
+    process.exit(2);
+  }
+  const m = /clean \((\d+) internal-term rules/.exec(r.stdout ?? '');
+  if (!m) fail('could not read the denylist rule count');
+  return Number(m[1]);
+}
+
+// Allowlisted addresses get the generic rules only in the author/committer
+// fields and in sign-off / co-author trailer lines that carry them.
+function applyIdentityAllowlist(out, args, messages) {
+  // Strict on purpose (same pattern in the ops scan): key at the line start,
+  // a short name without angle brackets, exactly one address, nothing after it.
+  const TRAILER = /^(?:signed-off-by|co-authored-by):[^<>]{0,100}<([^<>\s]+)>\s*$/i;
   const allowed = new Set((process.env.HYGIENE_ALLOWED_IDENTITIES ?? '')
     .split(/[\s,]+/).map(s => s.trim().toLowerCase()).filter(Boolean));
   if (allowed.size === 0) return;
+  const isAllowed = a => allowed.has(a.trim().toLowerCase());
+
   const file = join(out, 'identity-emails.txt');
   const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
-  const keep = lines.filter(l => !allowed.has(l.trim().toLowerCase()));
-  const exempt = lines.filter(l => allowed.has(l.trim().toLowerCase()));
-  writeFileSync(file, keep.join('\n'));
-  if (exempt.length === 0) return;
-  const exemptFile = join(out, 'identity-emails-allowed.txt');
-  writeFileSync(exemptFile, exempt.join('\n'));
-  args.push('--rules', 'generic', '--label', 'commit-email-allowed', '--text', exemptFile);
-  console.log(`${exempt.length} commit identity address(es) on the allowlist: generic rules only`);
+  writeFileSync(file, lines.filter(l => !isAllowed(l)).join('\n'));
+  const exempt = lines.filter(isAllowed);
+  if (exempt.length) {
+    const exemptFile = join(out, 'identity-emails-allowed.txt');
+    writeFileSync(exemptFile, exempt.join('\n'));
+    args.push('--rules', 'generic', '--label', 'commit-email-allowed', '--text', exemptFile);
+  }
+
+  const where = [];
+  for (const { file: msgFile, label } of messages) {
+    const msg = readFileSync(msgFile, 'utf8').split('\n');
+    // keep line numbers: the trailer line is blanked in the all-rules copy and
+    // kept at the same position in a generic-rules copy
+    const generic = msg.map(l => {
+      const m = TRAILER.exec(l);
+      return m && isAllowed(m[1]) ? l : '';
+    });
+    if (!generic.some(Boolean)) continue;
+    generic.forEach((l, i) => { if (l) where.push(`${label}:${i + 1}`); });
+    writeFileSync(msgFile, msg.map((l, i) => (generic[i] ? '' : l)).join('\n'));
+    const trailerFile = `${msgFile}.trailers`;
+    writeFileSync(trailerFile, generic.join('\n'));
+    args.push('--rules', 'generic', '--label', label, '--text', trailerFile);
+  }
+  console.log(`identity allowlist: ${exempt.length} commit address(es), ${where.length} trailer line(s) with generic rules only`);
+  // locations only, like hygiene:allow: the lines themselves are not printed
+  for (const w of where) console.log(`  - ${w}  trailer (generic rules only)`);
 }
