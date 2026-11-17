@@ -297,3 +297,21 @@ test('shallow checkout: only the history of base and head is fetched', () => {
   assert.match(r.log, new RegExp(`commit-${bad.slice(0, 12)}:b\\.txt:1 {2}internal-term #1`));
   assert.equal(sh(dir, 'rev-parse', '--is-shallow-repository'), 'false');
 });
+
+test('allowed identities: a trailer with a CRLF line ending stays exempt', () => {
+  const { dir, base } = repo();
+  writeFileSync(join(dir, 'b.txt'), 'x\n');
+  sh(dir, 'add', '-A');
+  const msg = ['Update', '', `Signed-off-by: Maintainer <${ORG_MAIL}>`, `Mention acme-internal`, ''].join('\r\n');
+  const c = spawnSync('git', ['-C', dir, 'commit', '-q', '--cleanup=verbatim', '-m', msg], {
+    env: { ...process.env, ...GIT_ENV, GIT_AUTHOR_EMAIL: ORG_MAIL, GIT_COMMITTER_EMAIL: ORG_MAIL },
+  });
+  assert.equal(c.status, 0);
+  const head = sh(dir, 'rev-parse', 'HEAD');
+  assert.ok(sh(dir, 'log', '-1', '--format=%B', head).includes('\r'), 'message keeps CRLF');
+  const r = gate({ dir, base, head, allowedIdentities: ORG_MAIL });
+  assert.equal(r.code, 1);
+  assert.match(r.log, /- commit-[0-9a-f]{12}:3 {2}trailer \(generic rules only\)/);
+  assert.match(r.log, /commit-[0-9a-f]{12}:4 {2}internal-term #1/);
+  assert.ok(!/commit-[0-9a-f]{12}:3 {2}internal-term/.test(r.log), 'CRLF trailer is exempt');
+});
