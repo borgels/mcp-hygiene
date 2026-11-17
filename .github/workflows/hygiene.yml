@@ -24,7 +24,7 @@ jobs:
     env:
       # Revision of scripts/ in borgels/mcp-hygiene. Bump after changing scripts/.
       SCANNER_REPO: borgels/mcp-hygiene
-      SCANNER_SHA: b8a2994042aa01a797bfe415f18fe47e489dbe2f
+      SCANNER_SHA: 7a60cc29959b849b0f65977de82719d0d15232e1
       GITLEAKS_VERSION: 8.30.1
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
