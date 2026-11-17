@@ -226,6 +226,33 @@ test('allowed identities: sign-off and co-author trailers with the address are e
   const r = gate({ dir, base, head, allowedIdentities: ORG_MAIL });
   assert.equal(r.code, 0, r.log);
   assert.match(r.log, /1 commit address\(es\), 2 trailer line\(s\)/);
+  // exempt trailer locations are listed, the lines themselves are not
+  assert.match(r.log, /- commit-[0-9a-f]{12}:3 {2}trailer \(generic rules only\)/);
+  assert.match(r.log, /- commit-[0-9a-f]{12}:4 {2}trailer \(generic rules only\)/);
+  assert.ok(!r.log.includes(ORG_MAIL), 'trailer text is not printed');
+});
+
+test('allowed identities: trailer exemption cannot carry other text or addresses', () => {
+  const { dir, base } = repo();
+  const msg = [
+    'Update',
+    '',
+    // second address riding along with the allowlisted one
+    `Co-authored-by: X <other${AT}acme-internal.example> <${ORG_MAIL}>`,
+    // indented, and a space before the colon
+    `  Signed-off-by: acme-internal <${ORG_MAIL}>`,
+    `Signed-off-by : acme-internal <${ORG_MAIL}>`,
+    // long free text in the name part
+    `Co-authored-by: ${'acme-internal notes '.repeat(6)}<${ORG_MAIL}>`,
+    // control: a plain trailer with a non-ASCII name stays exempt
+    `Co-authored-by: Søren Ærbø <${ORG_MAIL}>`,
+  ].join('\n');
+  const head = authored(dir, { 'b.txt': 'x\n' }, msg);
+  const r = gate({ dir, base, head, allowedIdentities: ORG_MAIL });
+  assert.equal(r.code, 1);
+  for (const line of [3, 4, 5, 6]) assert.match(r.log, new RegExp(`commit-[0-9a-f]{12}:${line} {2}internal-term #1`));
+  assert.match(r.log, /1 commit address\(es\), 1 trailer line\(s\)/);
+  assert.match(r.log, /- commit-[0-9a-f]{12}:7 {2}trailer \(generic rules only\)/);
 });
 
 test('allowed identities: other lines, other trailers and other addresses are still checked', () => {

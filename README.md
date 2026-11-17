@@ -104,7 +104,11 @@ gitleaks false positives use its own `gitleaks:allow` comment.
   rules only in the commit author/committer fields and in `Signed-off-by:` /
   `Co-authored-by:` trailer lines that carry them; the same address in file
   content, other message lines or pull request text is still checked with
-  every rule.
+  every rule. A trailer qualifies only in the strict form
+  `Key: Name <address>` at the start of a line, with a name of at most 100
+  characters and nothing after the address; its name part then gets the
+  generic rules only, like the author name. Exempt trailer locations are
+  listed in the job log.
 - The workflow runs `scripts/` from this repository at `SCANNER_SHA`. After a
   change there, bump it in `.github/workflows/hygiene.yml`; CI warns on pull
   requests and fails on `main` while they differ.

@@ -168,7 +168,9 @@ function internalRuleCount(out) {
 // Allowlisted addresses get the generic rules only in the author/committer
 // fields and in sign-off / co-author trailer lines that carry them.
 function applyIdentityAllowlist(out, args, messages) {
-  const TRAILER = /^\s*(?:signed-off-by|co-authored-by)\s*:.*<([^<>\s]+)>\s*$/i;
+  // Strict on purpose (same pattern in the ops scan): key at the line start,
+  // a short name without angle brackets, exactly one address, nothing after it.
+  const TRAILER = /^(?:signed-off-by|co-authored-by):[^<>]{0,100}<([^<>\s]+)>\s*$/i;
   const allowed = new Set((process.env.HYGIENE_ALLOWED_IDENTITIES ?? '')
     .split(/[\s,]+/).map(s => s.trim().toLowerCase()).filter(Boolean));
   if (allowed.size === 0) return;
@@ -184,18 +186,23 @@ function applyIdentityAllowlist(out, args, messages) {
     args.push('--rules', 'generic', '--label', 'commit-email-allowed', '--text', exemptFile);
   }
 
-  let trailers = 0;
+  const where = [];
   for (const { file: msgFile, label } of messages) {
     const msg = readFileSync(msgFile, 'utf8').split('\n');
     // keep line numbers: the trailer line is blanked in the all-rules copy and
     // kept at the same position in a generic-rules copy
-    const generic = msg.map(l => (TRAILER.test(l) && isAllowed(TRAILER.exec(l)[1]) ? l : ''));
+    const generic = msg.map(l => {
+      const m = TRAILER.exec(l);
+      return m && isAllowed(m[1]) ? l : '';
+    });
     if (!generic.some(Boolean)) continue;
-    trailers += generic.filter(Boolean).length;
+    generic.forEach((l, i) => { if (l) where.push(`${label}:${i + 1}`); });
     writeFileSync(msgFile, msg.map((l, i) => (generic[i] ? '' : l)).join('\n'));
     const trailerFile = `${msgFile}.trailers`;
     writeFileSync(trailerFile, generic.join('\n'));
     args.push('--rules', 'generic', '--label', label, '--text', trailerFile);
   }
-  console.log(`identity allowlist: ${exempt.length} commit address(es), ${trailers} trailer line(s) with generic rules only`);
+  console.log(`identity allowlist: ${exempt.length} commit address(es), ${where.length} trailer line(s) with generic rules only`);
+  // locations only, like hygiene:allow: the lines themselves are not printed
+  for (const w of where) console.log(`  - ${w}  trailer (generic rules only)`);
 }
